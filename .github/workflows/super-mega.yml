@@ -30,30 +30,41 @@ jobs:
           fetch-depth: 0
 
       ################################################################
-      # STEP 2 — CLEANER + ONLINE FILTER
-      # - Deduplicate by channel name (2B)
-      # - Sort by channel name (1A)
-      # - Keep logos/metadata
-      # - Filter offline: fast curl probe (HEAD or tiny GET) with 6s timeout
+      # STEP 2 — HELPERS: safe fetch, cleaner, CSV writer
       ################################################################
-      - name: Define cleaning and csv builders
+      - name: Define helper scripts (safe fetch / clean / csv)
         run: |
           set -euo pipefail
 
+          # safe_fetch: appends URL to a file with retries; never fails the job on 404
+          cat << 'EOF' > safe_fetch.sh
+          #!/usr/bin/env bash
+          set -euo pipefail
+          url="$1"; outfile="$2"
+          # Try up to 3 times; follow redirects; small timeouts
+          if ! curl -fsSL --retry 3 --retry-delay 2 --max-time 20 -A "Mozilla/5.0 GitHubActions" -L "$url" >> "$outfile"; then
+            echo "WARN: skipping (HTTP 404/timeout): $url" >&2
+          fi
+          EOF
+          chmod +x safe_fetch.sh
+
           # Clean & filter: input M3U -> output cleaned M3U
+          # - Deduplicate by channel name (2B)
+          # - Sort by channel name (1A)
+          # - Keep metadata lines (#EXTINF with tvg-* fields)
+          # - Filter OFFLINE (HEAD then tiny GET)
           cat << 'EOF' > clean.sh
           #!/usr/bin/env bash
           set -euo pipefail
           infile="$1"
           outfile="$2"
 
-          # Build triplets: sortkey \t EXTINF \t URL (dedupe by name)
           awk '
             BEGIN{ OFS="\t" }
             /^#EXTINF/ {
               ext = $0
               name = ext
-              sub(/^.*,/, "", name)             # channel name after last comma
+              sub(/^.*,/, "", name)
               gsub(/^[ \t]+|[ \t]+$/, "", name)
               url = ""
               while ( (getline line) > 0 ) {
@@ -67,18 +78,16 @@ jobs:
             }
           ' "$infile" > _pairs.tsv
 
-          # ONLINE FILTER (HEAD then GET --range 0-0)
           rm -f _live.tsv _dead.tsv
           while IFS=$'\t' read -r key ext url; do
             if curl -fsSIL --max-time 6 -A "Mozilla/5.0 GitHubActions" -L "$url" >/dev/null 2>&1 \
-            || curl -fsSL --max-time 6 -A "Mozilla/5.0 GitHubActions" -L --range 0-0 "$url" >/dev/null 2>&1; then
+            || curl -fsSL  --max-time 6 -A "Mozilla/5.0 GitHubActions" -L --range 0-0 "$url" >/dev/null 2>&1; then
               printf "%s\t%s\t%s\n" "$key" "$ext" "$url" >> _live.tsv
             else
               printf "%s\t%s\t%s\n" "$key" "$ext" "$url" >> _dead.tsv
             fi
           done < _pairs.tsv
 
-          # Sort by name and rebuild M3U
           {
             echo "#EXTM3U"
             sort -f -t $'\t' -k1,1 _live.tsv | awk -F'\t' '{print $2 "\n" $3}'
@@ -98,7 +107,6 @@ jobs:
           set -euo pipefail
           infile="$1"
           outfile="$2"
-
           echo "name,url" > "$outfile"
           awk '
             /^#EXTINF/ {
@@ -108,7 +116,7 @@ jobs:
               gsub(/^[ \t]+|[ \t]+$/, "", name)
               getline url
               if (url ~ /^https?:\/\//) {
-                gsub(/"/, "\"\"", name)    # escape quotes for CSV
+                gsub(/"/, "\"\"", name)
                 printf "\"%s\",%s\n", name, url
               }
             }
@@ -117,56 +125,43 @@ jobs:
           chmod +x m3u_to_csv.sh
 
       ################################################################
-      # STEP 3 — DOWNLOAD RAW PLAYLISTS (countries/languages/categories + mega-raw)
-      # iptv-org provides country/language/category/global playlists.  [1](https://github.com/iptv-org/epg)[2](https://github.com/albertovm/iptv-epg)
+      # STEP 3 — DOWNLOAD RAW PLAYLISTS (safe fetch)
+      # iptv-org provides country, language, category & global playlists.  [1](https://github.com/iptv-org/epg)[2](https://github.com/albertovm/iptv-epg)
       ################################################################
       - name: Build Raw Playlists
         run: |
           set -euo pipefail
-
           mkdir -p countries languages categories data/countries data/languages data/categories site
 
           echo "#EXTM3U" > mega_raw.m3u
 
-          # COUNTRIES (IN, BD, PK, US, UK, ES)
-          declare -A country_map=(
-            ["india"]="in"
-            ["bangladesh"]="bd"
-            ["pakistan"]="pk"
-            ["usa"]="us"
-            ["uk"]="gb"
-            ["spain"]="es"
-          )
+          # Countries (IN, BD, PK, US, UK, ES)
+          declare -A country_map=( ["india"]="in" ["bangladesh"]="bd" ["pakistan"]="pk" ["usa"]="us" ["uk"]="gb" ["spain"]="es" )
           for country in india bangladesh pakistan usa uk spain; do
             code="${country_map[$country]}"
             echo "#EXTM3U" > "countries/${country}.raw.m3u"
-            curl -fsSL "https://iptv-org.github.io/iptv/countries/${code}.m3u" >> "countries/${country}.raw.m3u"
+            ./safe_fetch.sh "https://iptv-org.github.io/iptv/countries/${code}.m3u" "countries/${country}.raw.m3u"
             cat "countries/${country}.raw.m3u" >> mega_raw.m3u
           done
 
-          # LANGUAGES (English / Hindi / Bengali / Urdu)
-          declare -A lang_map=(
-            ["english"]="eng"
-            ["hindi"]="hin"
-            ["bengali"]="ben"
-            ["urdu"]="urd"
-          )
+          # Languages (English / Hindi / Bengali / Urdu)
+          declare -A lang_map=( ["english"]="eng" ["hindi"]="hin" ["bengali"]="ben" ["urdu"]="urd" )
           for lang in english hindi bengali urdu; do
             code="${lang_map[$lang]}"
             echo "#EXTM3U" > "languages/${lang}.raw.m3u"
-            curl -fsSL "https://iptv-org.github.io/iptv/languages/${code}.m3u" >> "languages/${lang}.raw.m3u"
+            ./safe_fetch.sh "https://iptv-org.github.io/iptv/languages/${code}.m3u" "languages/${lang}.raw.m3u"
             cat "languages/${lang}.raw.m3u" >> mega_raw.m3u
           done
 
-          # CATEGORIES (Sports / Movies / Kids / Music / News)
+          # Categories (Sports / Movies / Kids / Music / News)
           for cat in sports movies kids music news; do
             echo "#EXTM3U" > "categories/${cat}.raw.m3u"
-            curl -fsSL "https://iptv-org.github.io/iptv/categories/${cat}.m3u" >> "categories/${cat}.raw.m3u"
+            ./safe_fetch.sh "https://iptv-org.github.io/iptv/categories/${cat}.m3u" "categories/${cat}.raw.m3u"
             cat "categories/${cat}.raw.m3u" >> mega_raw.m3u
           done
 
-          # GLOBAL MASTER (~8000 channels)
-          curl -fsSL "https://iptv-org.github.io/iptv/index.m3u" >> mega_raw.m3u
+          # Global master (~8000 channels)  [6](https://epg.pw/xmltv.html?lang=en)
+          ./safe_fetch.sh "https://iptv-org.github.io/iptv/index.m3u" "mega_raw.m3u"
 
       ################################################################
       # STEP 4 — CLEAN + SORT + DEDUPE + FILTER OFFLINE + CSVs
@@ -204,8 +199,8 @@ jobs:
           rm -f countries/*.raw.m3u languages/*.raw.m3u categories/*.raw.m3u mega_raw.m3u
 
       ################################################################
-      # STEP 5 — AUTO-GENERATE README (badges + counts + links)
-      # Badges: GH workflow status + last-commit (Shields)  [5](https://www.jiotv.com/)[6](https://www.jio.com/jiohome/services/jiotvplus/)
+      # STEP 5 — README (badges + counts + links)
+      # Badges: GH workflow status + last-commit (Shields)  [7](https://www.jiotv.com/)[8](https://www.jio.com/jiohome/services/jiotvplus/)
       ################################################################
       - name: Generate README
         run: |
@@ -216,15 +211,12 @@ jobs:
           ci_badge="https://github.com/${GITHUB_REPOSITORY}/actions/workflows/super-mega.yml/badge.svg?branch=${GITHUB_REF_NAME}"
           last_commit="https://img.shields.io/github/last-commit/${GITHUB_REPOSITORY}?logo=github"
 
-          # Country counts
           IN=$(count countries/india.m3u) ; BD=$(count countries/bangladesh.m3u) ; PK=$(count countries/pakistan.m3u)
           US=$(count countries/usa.m3u)   ; UK=$(count countries/uk.m3u)         ; ES=$(count countries/spain.m3u)
 
-          # Language counts
           ENG=$(count languages/english.m3u) ; HIN=$(count languages/hindi.m3u)
           BEN=$(count languages/bengali.m3u) ; URD=$(count languages/urdu.m3u)
 
-          # Category counts
           SPO=$(count categories/sports.m3u) ; MOV=$(count categories/movies.m3u)
           KID=$(count categories/kids.m3u)   ; MUS=$(count categories/music.m3u)
           NEW=$(count categories/news.m3u)
@@ -241,7 +233,7 @@ jobs:
           • Offline channels are filtered using fast HTTP checks.  
           • EPG: \`https://iptv-org.github.io/epg/guides.xml\`
 
-          > Browse the **HTML catalog**: **https://${GITHUB_REPOSITORY%/*}.github.io/${GITHUB_REPOSITORY#*/}/**
+          > Browse the **HTML catalog**: **https://${GITHUB_REPOSITORY%%/*}.github.io/${GITHUB_REPOSITORY#*/}/**
 
           ## Playlists
 
@@ -276,24 +268,25 @@ jobs:
           EOF
 
       ################################################################
-      # STEP 6 — BUILD HTML CATALOG (GitHub Pages)
-      # Simple UI that loads CSVs and plays selected streams with hls.js
+      # STEP 6 — BUILD HTML CATALOG (GitHub Pages) — fixed <link>/<script> tags
       ################################################################
       - name: Build HTML Catalog
         run: |
           set -euo pipefail
-
           mkdir -p site/assets
 
-          # Lightweight index.html
-          cat > site/index.html <<'HTML'
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          BASE_RAW="https://raw.githubusercontent.com/${OWNER}/${REPO}/main"
+
+          cat > site/index.html <<HTML
           <!doctype html>
           <html lang="en">
           <head>
             <meta charset="utf-8"/>
             <meta name="viewport" content="width=device-width, initial-scale=1"/>
             <title>Mega IPTV Catalog</title>
-            <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+            <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css"/>
             <style>
               body { padding: 1rem; }
               .grid { display: grid; grid-template-columns: 300px 1fr; gap: 1rem; }
@@ -324,7 +317,7 @@ jobs:
                     <ul id="list-categories"></ul>
                   </details>
                   <hr/>
-                  <p><a id="megaCsv" href="#" target="_blank">Download Mega CSV</a></p>
+                  <p><a id="megaCsv" href="#">Download Mega CSV</a></p>
                 </aside>
 
                 <section>
@@ -343,33 +336,30 @@ jobs:
 
             <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
             <script>
-              const repo = location.pathname.replace(/^\\//,'').split('/')[0] ? location.pathname.split('/')[1] : '${GITHUB_REPOSITORY?.split('/')?.[1] ?? ""}';
-              const owner = location.hostname.split('.')[0]; // username
-              const baseRaw = `https://raw.githubusercontent.com/${owner}/${repo}/main`;
-
+              const baseRaw = "${BASE_RAW}";
               const playlists = {
                 countries: {
-                  india:       `${baseRaw}/data/countries/india.csv`,
-                  bangladesh:  `${baseRaw}/data/countries/bangladesh.csv`,
-                  pakistan:    `${baseRaw}/data/countries/pakistan.csv`,
-                  usa:         `${baseRaw}/data/countries/usa.csv`,
-                  uk:          `${baseRaw}/data/countries/uk.csv`,
-                  spain:       `${baseRaw}/data/countries/spain.csv`,
+                  india:       baseRaw + "/data/countries/india.csv",
+                  bangladesh:  baseRaw + "/data/countries/bangladesh.csv",
+                  pakistan:    baseRaw + "/data/countries/pakistan.csv",
+                  usa:         baseRaw + "/data/countries/usa.csv",
+                  uk:          baseRaw + "/data/countries/uk.csv",
+                  spain:       baseRaw + "/data/countries/spain.csv",
                 },
                 languages: {
-                  english: `${baseRaw}/data/languages/english.csv`,
-                  hindi:   `${baseRaw}/data/languages/hindi.csv`,
-                  bengali: `${baseRaw}/data/languages/bengali.csv`,
-                  urdu:    `${baseRaw}/data/languages/urdu.csv`,
+                  english: baseRaw + "/data/languages/english.csv",
+                  hindi:   baseRaw + "/data/languages/hindi.csv",
+                  bengali: baseRaw + "/data/languages/bengali.csv",
+                  urdu:    baseRaw + "/data/languages/urdu.csv",
                 },
                 categories: {
-                  sports: `${baseRaw}/data/categories/sports.csv`,
-                  movies: `${baseRaw}/data/categories/movies.csv`,
-                  kids:   `${baseRaw}/data/categories/kids.csv`,
-                  music:  `${baseRaw}/data/categories/music.csv`,
-                  news:   `${baseRaw}/data/categories/news.csv`,
+                  sports: baseRaw + "/data/categories/sports.csv",
+                  movies: baseRaw + "/data/categories/movies.csv",
+                  kids:   baseRaw + "/data/categories/kids.csv",
+                  music:  baseRaw + "/data/categories/music.csv",
+                  news:   baseRaw + "/data/categories/news.csv",
                 },
-                mega: `${baseRaw}/data/mega.csv`
+                mega: baseRaw + "/data/mega.csv"
               };
 
               document.getElementById('megaCsv').href = playlists.mega;
@@ -396,9 +386,9 @@ jobs:
 
               async function loadCsv(url){
                 const res = await fetch(url); const text = await res.text();
-                const lines = text.trim().split(/\\r?\\n/).slice(1); // skip header
+                const lines = text.trim().split(/\\r?\\n/).slice(1);
                 rows = lines.map(l => {
-                  const m = l.match(/^\"?(.*?)\"?,(https?:.*)$/); 
+                  const m = l.match(/^\"?(.*?)\"?,(https?:.*)$/);
                   return m ? {name:m[1].replace(/\"\"/g,'"'), url:m[2]} : null;
                 }).filter(Boolean);
                 render();
@@ -429,7 +419,8 @@ jobs:
                 if (video.canPlayType('application/vnd.apple.mpegurl')) {
                   video.src = url; video.play();
                 } else if (Hls.isSupported()){
-                  hls = new Hls(); hls.loadSource(url); hls.attachMedia(video); hls.on(Hls.Events.MANIFEST_PARSED, ()=>video.play());
+                  hls = new Hls(); hls.loadSource(url); hls.attachMedia(video);
+                  hls.on(Hls.Events.MANIFEST_PARSED, ()=>video.play());
                 } else {
                   alert('HLS not supported in this browser.');
                 }
@@ -443,7 +434,7 @@ jobs:
           HTML
 
       ################################################################
-      # STEP 7 — COMMIT & PUSH (PAT) with safe rebase
+      # STEP 7 — COMMIT & PUSH (PAT) with safe rebase to avoid conflicts
       ################################################################
       - name: Commit and Push Changes (PAT)
         env:
@@ -452,11 +443,12 @@ jobs:
           BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+
           git config --global user.name "AutoBot"
           git config --global user.email "bot@example.com"
 
           git add .
-          git commit -m "CSV summaries + HTML catalog (click-to-play) + cleaned & sorted" || echo "No changes"
+          git commit -m "Hardened fetch (skip 404) + fixed HTML tags + CSV/HTML catalog + cleaned & sorted" || echo "No changes"
 
           git remote set-url origin "https://sarfaraj74-Tech:${TOKEN}@github.com/${REPO}.git"
           git fetch origin
