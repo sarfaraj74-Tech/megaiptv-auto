@@ -36,28 +36,35 @@ jobs:
         run: |
           set -euo pipefail
 
-          # safe_fetch: appends URL to a file with retries; never fails the job on 404
+          # safe_fetch: appends URL to a file with retries; never fails the job on 404/timeouts
           cat << 'EOF' > safe_fetch.sh
           #!/usr/bin/env bash
           set -euo pipefail
           url="$1"; outfile="$2"
-          # Try up to 3 times; follow redirects; small timeouts
           if ! curl -fsSL --retry 3 --retry-delay 2 --max-time 20 -A "Mozilla/5.0 GitHubActions" -L "$url" >> "$outfile"; then
             echo "WARN: skipping (HTTP 404/timeout): $url" >&2
           fi
           EOF
           chmod +x safe_fetch.sh
 
-          # Clean & filter: input M3U -> output cleaned M3U
-          # - Deduplicate by channel name (2B)
-          # - Sort by channel name (1A)
-          # - Keep metadata lines (#EXTINF with tvg-* fields)
+          # clean.sh
+          # - Deduplicate by channel NAME (2B)
+          # - Sort by NAME A→Z (1A)
+          # - Keep #EXTINF metadata (logos etc.)
           # - Filter OFFLINE (HEAD then tiny GET)
+          # - Handle empty inputs safely (no _live.tsv -> create empty)
           cat << 'EOF' > clean.sh
           #!/usr/bin/env bash
           set -euo pipefail
           infile="$1"
           outfile="$2"
+
+          # If file missing or only has header, write minimal M3U and exit
+          if [ ! -s "$infile" ] || ! grep -q '^#EXTINF' "$infile"; then
+            echo "#EXTM3U" > "$outfile"
+            echo "CLEAN: $(basename "$outfile"): kept=0, filtered_offline=0" >&2
+            exit 0
+          fi
 
           awk '
             BEGIN{ OFS="\t" }
@@ -78,7 +85,19 @@ jobs:
             }
           ' "$infile" > _pairs.tsv
 
-          rm -f _live.tsv _dead.tsv
+          # If no pairs, produce empty playlist and exit
+          if [ ! -s _pairs.tsv ]; then
+            echo "#EXTM3U" > "$outfile"
+            echo "CLEAN: $(basename "$outfile"): kept=0, filtered_offline=0" >&2
+            rm -f _pairs.tsv
+            exit 0
+          fi
+
+          # Ensure files exist even if nothing is live
+          : > _live.tsv
+          : > _dead.tsv
+
+          # Probe reachability (HEAD → tiny GET fallback)
           while IFS=$'\t' read -r key ext url; do
             if curl -fsSIL --max-time 6 -A "Mozilla/5.0 GitHubActions" -L "$url" >/dev/null 2>&1 \
             || curl -fsSL  --max-time 6 -A "Mozilla/5.0 GitHubActions" -L --range 0-0 "$url" >/dev/null 2>&1; then
@@ -88,9 +107,12 @@ jobs:
             fi
           done < _pairs.tsv
 
+          # Sort by name and rebuild M3U (handle empty _live.tsv)
           {
             echo "#EXTM3U"
-            sort -f -t $'\t' -k1,1 _live.tsv | awk -F'\t' '{print $2 "\n" $3}'
+            if [ -s _live.tsv ]; then
+              sort -f -t $'\t' -k1,1 _live.tsv | awk -F'\t' '{print $2 "\n" $3}'
+            fi
           } > "$outfile"
 
           live=$(wc -l < _live.tsv 2>/dev/null || echo 0)
@@ -101,32 +123,34 @@ jobs:
           EOF
           chmod +x clean.sh
 
-          # CSV writer: cleaned M3U -> CSV (name,url)
+          # CSV writer: cleaned M3U -> CSV (name,url), works even if no #EXTINF present
           cat << 'EOF' > m3u_to_csv.sh
           #!/usr/bin/env bash
           set -euo pipefail
           infile="$1"
           outfile="$2"
           echo "name,url" > "$outfile"
-          awk '
-            /^#EXTINF/ {
-              ext=$0
-              name=ext
-              sub(/^.*,/, "", name)
-              gsub(/^[ \t]+|[ \t]+$/, "", name)
-              getline url
-              if (url ~ /^https?:\/\//) {
-                gsub(/"/, "\"\"", name)
-                printf "\"%s\",%s\n", name, url
+          if grep -q '^#EXTINF' "$infile"; then
+            awk '
+              /^#EXTINF/ {
+                ext=$0
+                name=ext
+                sub(/^.*,/, "", name)
+                gsub(/^[ \t]+|[ \t]+$/, "", name)
+                getline url
+                if (url ~ /^https?:\/\//) {
+                  gsub(/"/, "\"\"", name)
+                  printf "\"%s\",%s\n", name, url
+                }
               }
-            }
-          ' "$infile" >> "$outfile"
+            ' "$infile" >> "$outfile"
+          fi
           EOF
           chmod +x m3u_to_csv.sh
 
       ################################################################
-      # STEP 3 — DOWNLOAD RAW PLAYLISTS (safe fetch)
-      # iptv-org provides country, language, category & global playlists.  [1](https://github.com/iptv-org/epg)[2](https://github.com/albertovm/iptv-epg)
+      # STEP 3 — DOWNLOAD RAW PLAYLISTS (safe fetch with retries, skip on 404)
+      # iptv-org provides country/language/category/global playlists.  [1](https://github.com/iptv-org/epg)[2](https://github.com/albertovm/iptv-epg)
       ################################################################
       - name: Build Raw Playlists
         run: |
@@ -160,7 +184,7 @@ jobs:
             cat "categories/${cat}.raw.m3u" >> mega_raw.m3u
           done
 
-          # Global master (~8000 channels)  [6](https://epg.pw/xmltv.html?lang=en)
+          # Global master (~8000 channels)  [3](https://epg.pw/xmltv.html?lang=en)
           ./safe_fetch.sh "https://iptv-org.github.io/iptv/index.m3u" "mega_raw.m3u"
 
       ################################################################
@@ -200,7 +224,7 @@ jobs:
 
       ################################################################
       # STEP 5 — README (badges + counts + links)
-      # Badges: GH workflow status + last-commit (Shields)  [7](https://www.jiotv.com/)[8](https://www.jio.com/jiohome/services/jiotvplus/)
+      # Badges: GH workflow status + last-commit (Shields)  [4](https://www.jiotv.com/)[5](https://www.jio.com/jiohome/services/jiotvplus/)
       ################################################################
       - name: Generate README
         run: |
@@ -268,7 +292,7 @@ jobs:
           EOF
 
       ################################################################
-      # STEP 6 — BUILD HTML CATALOG (GitHub Pages) — fixed <link>/<script> tags
+      # STEP 6 — BUILD HTML CATALOG (GitHub Pages) — valid tags
       ################################################################
       - name: Build HTML Catalog
         run: |
@@ -286,7 +310,7 @@ jobs:
             <meta charset="utf-8"/>
             <meta name="viewport" content="width=device-width, initial-scale=1"/>
             <title>Mega IPTV Catalog</title>
-            <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css"/>
+            <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css" />
             <style>
               body { padding: 1rem; }
               .grid { display: grid; grid-template-columns: 300px 1fr; gap: 1rem; }
@@ -317,7 +341,7 @@ jobs:
                     <ul id="list-categories"></ul>
                   </details>
                   <hr/>
-                  <p><a id="megaCsv" href="#">Download Mega CSV</a></p>
+                  <p><a id="megaCsv" href="#" target="_blank" rel="noopener">Download Mega CSV</a></p>
                 </aside>
 
                 <section>
@@ -385,8 +409,10 @@ jobs:
               let rows = [];
 
               async function loadCsv(url){
-                const res = await fetch(url); const text = await res.text();
-                const lines = text.trim().split(/\\r?\\n/).slice(1);
+                const res = await fetch(url);
+                if (!res.ok) { tbody.innerHTML = '<tr><td colspan="2">No data available.</td></tr>'; return; }
+                const text = await res.text();
+                const lines = text.trim().split(/\\r?\\n/).slice(1); // skip header
                 rows = lines.map(l => {
                   const m = l.match(/^\"?(.*?)\"?,(https?:.*)$/);
                   return m ? {name:m[1].replace(/\"\"/g,'"'), url:m[2]} : null;
@@ -397,7 +423,12 @@ jobs:
               function render(){
                 const q = search.value.toLowerCase();
                 tbody.innerHTML = '';
-                rows.filter(r => r.name.toLowerCase().includes(q)).forEach(r=>{
+                const filtered = rows.filter(r => r.name.toLowerCase().includes(q));
+                if (filtered.length === 0) {
+                  tbody.innerHTML = '<tr><td colspan="2">No channels found.</td></tr>';
+                  return;
+                }
+                filtered.forEach(r=>{
                   const tr=document.createElement('tr');
                   const td1=document.createElement('td'); td1.textContent=r.name;
                   const td2=document.createElement('td'); td2.className='nowrap';
@@ -448,7 +479,7 @@ jobs:
           git config --global user.email "bot@example.com"
 
           git add .
-          git commit -m "Hardened fetch (skip 404) + fixed HTML tags + CSV/HTML catalog + cleaned & sorted" || echo "No changes"
+          git commit -m "Hardened cleaner (empty-safe) + CSV/HTML catalog + cleaned & sorted" || echo "No changes"
 
           git remote set-url origin "https://sarfaraj74-Tech:${TOKEN}@github.com/${REPO}.git"
           git fetch origin
