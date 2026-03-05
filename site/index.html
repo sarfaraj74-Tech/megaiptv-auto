@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Mega IPTV Catalog</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css" />
+  <style>
+    body { padding: 1rem; }
+    .grid { display: grid; grid-template-columns: 300px 1fr; gap: 1rem; }
+    table { font-size: 0.9rem; }
+    #video { width: 100%; max-height: 60vh; background:#000; }
+    .muted { color: #777; font-size: .85rem; }
+    .nowrap { white-space: nowrap; }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <h2>Mega IPTV Catalog</h2>
+    <p class="muted">Click a list, pick a channel, then press ▶ Play.</p>
+
+    <div class="grid">
+      <aside>
+        <h4>Playlists</h4>
+        <details open>
+          <summary>Countries</summary>
+          <ul id="list-countries"></ul>
+        </details>
+        <details>
+          <summary>Languages</summary>
+          <ul id="list-languages"></ul>
+        </details>
+        <details>
+          <summary>Categories</summary>
+          <ul id="list-categories"></ul>
+        </details>
+        <hr/>
+        <p><a id="megaCsv" href="#" target="_blank" rel="noopener">Download Mega CSV</a></p>
+      </aside>
+
+      <section>
+        <video id="video" controls playsinline></video>
+        <div class="grid" style="grid-template-columns:1fr 220px; margin-top:.7rem;">
+          <input id="search" type="search" placeholder="Search channel…" />
+          <button id="clear">Clear</button>
+        </div>
+        <table id="table" role="grid">
+          <thead><tr><th>Channel</th><th class="nowrap">Action</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </section>
+    </div>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <script>
+    const baseRaw = "https://raw.githubusercontent.com/sarfaraj74-Tech/megaiptv-auto/main";
+    const playlists = {
+      countries: {
+        india:       baseRaw + "/data/countries/india.csv",
+        bangladesh:  baseRaw + "/data/countries/bangladesh.csv",
+        pakistan:    baseRaw + "/data/countries/pakistan.csv",
+        usa:         baseRaw + "/data/countries/usa.csv",
+        uk:          baseRaw + "/data/countries/uk.csv",
+        spain:       baseRaw + "/data/countries/spain.csv",
+      },
+      languages: {
+        english: baseRaw + "/data/languages/english.csv",
+        hindi:   baseRaw + "/data/languages/hindi.csv",
+        bengali: baseRaw + "/data/languages/bengali.csv",
+        urdu:    baseRaw + "/data/languages/urdu.csv",
+      },
+      categories: {
+        sports: baseRaw + "/data/categories/sports.csv",
+        movies: baseRaw + "/data/categories/movies.csv",
+        kids:   baseRaw + "/data/categories/kids.csv",
+        music:  baseRaw + "/data/categories/music.csv",
+        news:   baseRaw + "/data/categories/news.csv",
+      },
+      mega: baseRaw + "/data/mega.csv"
+    };
+
+    document.getElementById('megaCsv').href = playlists.mega;
+
+    const ulC = document.getElementById('list-countries');
+    const ulL = document.getElementById('list-languages');
+    const ulK = document.getElementById('list-categories');
+
+    const addLinks = (ul, obj) => {
+      Object.entries(obj).forEach(([k,url]) => {
+        const li=document.createElement('li'); const a=document.createElement('a');
+        a.href='#'; a.textContent=k; a.onclick=(e)=>{ e.preventDefault(); loadCsv(url); };
+        li.appendChild(a); ul.appendChild(li);
+      });
+    };
+    addLinks(ulC, playlists.countries);
+    addLinks(ulL, playlists.languages);
+    addLinks(ulK, playlists.categories);
+
+    const tbody = document.querySelector('#table tbody');
+    const search = document.getElementById('search');
+    const clear  = document.getElementById('clear');
+    let rows = [];
+
+    async function loadCsv(url){
+      const res = await fetch(url);
+      if (!res.ok) { tbody.innerHTML = '<tr><td colspan="2">No data available.</td></tr>'; return; }
+      const text = await res.text();
+      const lines = text.trim().split(/\r?\n/).slice(1); // skip header
+      rows = lines.map(l => {
+        const m = l.match(/^\"?(.*?)\"?,(https?:.*)$/);
+        return m ? {name:m[1].replace(/\"\"/g,'"'), url:m[2]} : null;
+      }).filter(Boolean);
+      render();
+    }
+
+    function render(){
+      const q = search.value.toLowerCase();
+      tbody.innerHTML = '';
+      const filtered = rows.filter(r => r.name.toLowerCase().includes(q));
+      if (filtered.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="2">No channels found.</td></tr>';
+        return;
+      }
+      filtered.forEach(r=>{
+        const tr=document.createElement('tr');
+        const td1=document.createElement('td'); td1.textContent=r.name;
+        const td2=document.createElement('td'); td2.className='nowrap';
+        const btn=document.createElement('button'); btn.textContent='▶ Play';
+        btn.onclick=()=>play(r.url);
+        td2.appendChild(btn);
+        tr.appendChild(td1); tr.appendChild(td2);
+        tbody.appendChild(tr);
+      });
+    }
+
+    search.addEventListener('input', render);
+    clear.addEventListener('click', ()=>{ search.value=''; render(); });
+
+    let hls;
+    function play(url){
+      const video = document.getElementById('video');
+      if (hls) { hls.destroy(); hls=null; }
+      if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = url; video.play();
+      } else if (Hls.isSupported()){
+        hls = new Hls(); hls.loadSource(url); hls.attachMedia(video);
+        hls.on(Hls.Events.MANIFEST_PARSED, ()=>video.play());
+      } else {
+        alert('HLS not supported in this browser.');
+      }
+    }
+
+    // Load something by default
+    loadCsv(playlists.mega);
+  </script>
+</body>
+</html>
