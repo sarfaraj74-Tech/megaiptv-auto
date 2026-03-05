@@ -1,4 +1,4 @@
-name: Auto-Build Mega Playlist (Language - Category)
+name: Auto-Build Mega Playlist (Category Mapped)
 
 on:
   schedule:
@@ -20,79 +20,88 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      # 2) Build mega.m3u with group-title="<Language> - <Category>"
+      # 2) Build mega.m3u grouped by Category using category playlists (C1 full set)
       - name: Build Mega Playlist
         run: |
           set -euo pipefail
 
-          # Fetch full global index with metadata (tvg-language, group-title, etc.)
-          curl -fsSL "https://iptv-org.github.io/iptv/index.m3u" -o full.m3u
+          work=tmp_cat
+          rm -rf "$work" || true
+          mkdir -p "$work"
 
-          # Write header
+          # ---- Fetch master list (official) ----
+          # Reference: iptv-org README documents index.m3u
+          curl -fsSL "https://iptv-org.github.io/iptv/index.m3u" -o "$work/full.m3u"
+
+          # ---- Fetch category lists (C1 set) ----
+          # These paths are documented/publicly mirrored under /categories/*.m3u
+          # Order below defines priority if a URL appears in multiple categories.
+          cats=(news sports movies kids music entertainment religious)
+
+          > "$work/urlmap.tsv"
+          for c in "${cats[@]}"; do
+            curl -fsSL "https://iptv-org.github.io/iptv/categories/${c}.m3u" -o "$work/${c}.m3u" || echo "#EXTM3U" > "$work/${c}.m3u"
+            # Append URL→Category pairs (TitleCase the category label here)
+            awk -v CAT="$c" '
+              function tcase(s,   a,i,out,w){ gsub(/[_-]/," ",s); split(s,a,/ +/); for(i=1;i<=length(a);i++){w=a[i]; if(w!="") out=(out?out" ":"") toupper(substr(w,1,1)) tolower(substr(w,2))} return out }
+              !/^#/ && /^https?:/ { print $0 "\t" tcase(CAT) }
+            ' "$work/${c}.m3u" >> "$work/urlmap.tsv"
+          done
+
+          # ---- Build a unique map (first category wins based on cats[] order above) ----
+          awk -F'\t' '!seen[$1]++' "$work/urlmap.tsv" > "$work/urlmap_first.tsv"
+
+          # ---- Generate mega.m3u with group-title=<Category> ----
           echo "#EXTM3U" > mega.m3u
 
-          # Transform each EXTINF so group-title becomes "<Language> - <Category>"
-          # - Language from tvg-language (fallback: Unknown)
-          # - Category from original group-title (fallback: General)
-          # - Title-case both
-          # - Preserve all other attributes (tvg-id, tvg-logo, tvg-language, etc.) and channel name
-          awk '
-            function trim(s) { gsub(/^[ \t\r\n]+|[ \t\r\n]+$/,"",s); return s }
-            function title(s,   a,i,out,w) {
-              s=trim(s); if (s=="") return s
-              split(s,a,/[ _-]+/)
-              out=""
-              for(i=1;i<=length(a);i++){
-                w=a[i]; if (w=="") continue
-                out = out (out==""?"":" ") toupper(substr(w,1,1)) tolower(substr(w,2))
+          awk -v MAP="$work/urlmap_first.tsv" '
+            function trim(s){ gsub(/^[ \t\r\n]+|[ \t\r\n]+$/,"",s); return s }
+            BEGIN{
+              FS="\n"; RS="\r?\n#EXTINF"; ORS=""
+              # Load URL→Category
+              while ((getline line < MAP) > 0) {
+                split(line, p, /\t/); url=p[1]; cat=p[2]
+                if (url != "" && cat != "") url2cat[url]=cat
               }
-              return out
+              close(MAP)
+              print ""  # reset ORS (avoid leading null)
             }
-            /^#EXTINF/ {
-              ext=$0
-              name=ext
-              # Extract channel name (text after last comma)
-              sub(/^.*,/, "", name)
-              # Extract tvg-language (may be empty or multi-valued)
-              lang=""
-              if (match(ext, /tvg-language="([^"]*)"/, m)) { lang = m[1] }
-              # Use first token if multiple (split on , ; /)
-              split(lang, lp, /[,;\/]/); lang = trim(lp[1])
-              if (lang == "") lang = "Unknown"
+            NR==1 { next }  # skip any header chunk prior to first EXTINF
 
-              # Extract original category from group-title
-              cat=""
-              if (match(ext, /group-title="([^"]*)"/, m2)) { cat = m2[1] }
-              if (cat == "") cat = "General"
+            {
+              # Reconstruct the EXTINF+URL pair
+              ext = "#EXTINF" $0
+              n = split(ext, lines, /\r?\n/)
+              if (n < 2) next
+              extline = lines[1]
+              url = ""
+              # Find the first non-comment line after EXTINF to use as URL
+              for (i=2; i<=n; i++) { if (lines[i] !~ /^#/) { url = trim(lines[i]); break } }
+              if (url == "") next
 
-              # Clean formatting (Title Case both)
-              lang = title(lang)
-              cat  = title(cat)
+              cat = url2cat[url]
+              if (cat == "" ) cat = "General"
 
-              # Build new group
-              newgrp = lang " - " cat
+              # Extract channel name
+              name = extline; sub(/^.*,/, "", name)
 
-              # Rebuild the EXTINF line with new group-title while preserving other attributes
-              before = ext
-              sub(/,.*$/, "", before)          # part before channel name
-              # If a group-title exists, replace it; otherwise, insert it before the comma
+              # Part before channel name
+              before = extline; sub(/,.*$/, "", before)
               if (before ~ /group-title="/) {
-                gsub(/group-title="[^"]*"/, "group-title=\"" newgrp "\"", before)
+                gsub(/group-title="[^"]*"/, "group-title=\"" cat "\"", before)
                 newext = before "," name
               } else {
-                newext = before " group-title=\"" newgrp "\"," name
+                newext = before " group-title=\"" cat "\"," name
               }
 
-              # Next line is the URL (print pair)
-              getline url
-              print newext >> "mega.m3u"
-              print url    >> "mega.m3u"
+              print newext "\n" url "\n"
             }
-          ' full.m3u
+          ' "$work/full.m3u" >> mega.m3u
 
-          rm -f full.m3u
+          # Clean up
+          rm -rf "$work"
 
-      # 3) Commit & push using PAT (safe rebase to avoid non-fast-forward)
+      # 3) Commit & push using PAT (safe rebase avoids non-fast-forward)
       - name: Commit & push
         env:
           TOKEN:  ${{ secrets.PAT_TOKEN }}
@@ -104,7 +113,7 @@ jobs:
           git config --global user.email "bot@example.com"
 
           git add mega.m3u
-          git commit -m "Auto: mega.m3u with group-title=<Language> - <Category>" || echo "No changes"
+          git commit -m "Auto: mega.m3u grouped by Category (URL membership from category playlists)" || echo "No changes"
 
           git remote set-url origin "https://sarfaraj74-Tech:${TOKEN}@github.com/${REPO}.git"
           git fetch origin
