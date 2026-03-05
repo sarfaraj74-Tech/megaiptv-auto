@@ -5,76 +5,130 @@ on:
     - cron: "0 */6 * * *"   # Run every 6 hours
   workflow_dispatch:
 
+# Needed for Pages deploy
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      ##############################
-      # STEP 1 — CHECKOUT
-      ##############################
+      ################################################################
+      # STEP 1 — CHECKOUT (no bot token persisted)
+      ################################################################
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           persist-credentials: false
           fetch-depth: 0
 
-      ##############################
-      # STEP 2 — DEFINE CLEAN FUNCTION
-      ##############################
-      - name: Define cleaning function
+      ################################################################
+      # STEP 2 — CLEANER + ONLINE FILTER
+      # - Deduplicate by channel name (2B)
+      # - Sort by channel name (1A)
+      # - Keep logos/metadata
+      # - Filter offline: fast curl probe (HEAD or tiny GET) with 6s timeout
+      ################################################################
+      - name: Define cleaning and csv builders
         run: |
+          set -euo pipefail
+
+          # Clean & filter: input M3U -> output cleaned M3U
           cat << 'EOF' > clean.sh
-          #!/bin/bash
+          #!/usr/bin/env bash
+          set -euo pipefail
           infile="$1"
           outfile="$2"
 
-          # Extract all EXTINF lines paired with URLs
-          paste -d'\n' <(grep -E "^#EXTINF" "$infile") <(grep -v "^#" "$infile" | grep -E "\.m3u8|http") > temp_pairs.txt
-
-          # Remove duplicates by channel name (2B)
-          # Extract channel name from the EXTINF line (after last comma)
-          awk -v FS="," '
-            NR%2==1 { 
-              name=$NF; gsub(/^[ \t]+|[ \t]+$/, "", name)
-              extinf=$0
-              getline url
-              if (!seen[name]++) {
-                print extinf >> "pairs_cleaned.txt"
-                print url >> "pairs_cleaned.txt"
+          # Build triplets: sortkey \t EXTINF \t URL (dedupe by name)
+          awk '
+            BEGIN{ OFS="\t" }
+            /^#EXTINF/ {
+              ext = $0
+              name = ext
+              sub(/^.*,/, "", name)             # channel name after last comma
+              gsub(/^[ \t]+|[ \t]+$/, "", name)
+              url = ""
+              while ( (getline line) > 0 ) {
+                if (line ~ /^#/) { continue }
+                if (line ~ /^https?:\/\//) { url=line; break }
+              }
+              if (url != "" && !(name in seen)) {
+                seen[name] = 1
+                print tolower(name), ext, url
               }
             }
-          ' temp_pairs.txt
+          ' "$infile" > _pairs.tsv
 
-          # Sort alphabetically by channel name (1A)
-          awk 'NR%2==1 {name=$0; getline url; print name"::"url}' pairs_cleaned.txt \
-            | sort -f \
-            | awk -F"::" '{print $1"\n"$2}' > sorted.txt
+          # ONLINE FILTER (HEAD then GET --range 0-0)
+          rm -f _live.tsv _dead.tsv
+          while IFS=$'\t' read -r key ext url; do
+            if curl -fsSIL --max-time 6 -A "Mozilla/5.0 GitHubActions" -L "$url" >/dev/null 2>&1 \
+            || curl -fsSL --max-time 6 -A "Mozilla/5.0 GitHubActions" -L --range 0-0 "$url" >/dev/null 2>&1; then
+              printf "%s\t%s\t%s\n" "$key" "$ext" "$url" >> _live.tsv
+            else
+              printf "%s\t%s\t%s\n" "$key" "$ext" "$url" >> _dead.tsv
+            fi
+          done < _pairs.tsv
 
-          # Rebuild final M3U
+          # Sort by name and rebuild M3U
           {
             echo "#EXTM3U"
-            cat sorted.txt
+            sort -f -t $'\t' -k1,1 _live.tsv | awk -F'\t' '{print $2 "\n" $3}'
           } > "$outfile"
 
-          rm -f temp_pairs.txt pairs_cleaned.txt sorted.txt
-          EOF
+          live=$(wc -l < _live.tsv 2>/dev/null || echo 0)
+          dead=$(wc -l < _dead.tsv 2>/dev/null || echo 0)
+          echo "CLEAN: $(basename "$outfile"): kept=${live}, filtered_offline=${dead}" >&2
 
+          rm -f _pairs.tsv _live.tsv _dead.tsv
+          EOF
           chmod +x clean.sh
 
-      ##############################
-      # STEP 3 — BUILD RAW PLAYLISTS
-      ##############################
+          # CSV writer: cleaned M3U -> CSV (name,url)
+          cat << 'EOF' > m3u_to_csv.sh
+          #!/usr/bin/env bash
+          set -euo pipefail
+          infile="$1"
+          outfile="$2"
+
+          echo "name,url" > "$outfile"
+          awk '
+            /^#EXTINF/ {
+              ext=$0
+              name=ext
+              sub(/^.*,/, "", name)
+              gsub(/^[ \t]+|[ \t]+$/, "", name)
+              getline url
+              if (url ~ /^https?:\/\//) {
+                gsub(/"/, "\"\"", name)    # escape quotes for CSV
+                printf "\"%s\",%s\n", name, url
+              }
+            }
+          ' "$infile" >> "$outfile"
+          EOF
+          chmod +x m3u_to_csv.sh
+
+      ################################################################
+      # STEP 3 — DOWNLOAD RAW PLAYLISTS (countries/languages/categories + mega-raw)
+      # iptv-org provides country/language/category/global playlists.  [1](https://github.com/iptv-org/epg)[2](https://github.com/albertovm/iptv-epg)
+      ################################################################
       - name: Build Raw Playlists
         run: |
-          mkdir -p countries languages categories
+          set -euo pipefail
 
-          echo '#EXTM3U url-tvg="https://iptv-org.github.io/epg/guides.xml"' > mega_raw.m3u
+          mkdir -p countries languages categories data/countries data/languages data/categories site
 
-          ##############################################################
-          # COUNTRIES (India / Bangladesh / Pakistan / USA / UK / Spain)
-          # Source: iptv-org country playlists  [1](https://www.jiotv.com/)
-          ##############################################################
+          echo "#EXTM3U" > mega_raw.m3u
+
+          # COUNTRIES (IN, BD, PK, US, UK, ES)
           declare -A country_map=(
             ["india"]="in"
             ["bangladesh"]="bd"
@@ -83,91 +137,347 @@ jobs:
             ["uk"]="gb"
             ["spain"]="es"
           )
-
-          for country in "${!country_map[@]}"; do
+          for country in india bangladesh pakistan usa uk spain; do
             code="${country_map[$country]}"
-            echo "#EXTM3U" > countries/${country}.raw.m3u
-            curl -s "https://iptv-org.github.io/iptv/countries/${code}.m3u" >> countries/${country}.raw.m3u
-            cat countries/${country}.raw.m3u >> mega_raw.m3u
+            echo "#EXTM3U" > "countries/${country}.raw.m3u"
+            curl -fsSL "https://iptv-org.github.io/iptv/countries/${code}.m3u" >> "countries/${country}.raw.m3u"
+            cat "countries/${country}.raw.m3u" >> mega_raw.m3u
           done
 
-          ##############################################################
           # LANGUAGES (English / Hindi / Bengali / Urdu)
-          # Source: iptv-org language playlists  [3](https://apps.apple.com/in/app/jiotv/id6467191146)
-          ##############################################################
           declare -A lang_map=(
             ["english"]="eng"
             ["hindi"]="hin"
             ["bengali"]="ben"
             ["urdu"]="urd"
           )
-
-          for lang in "${!lang_map[@]}"; do
+          for lang in english hindi bengali urdu; do
             code="${lang_map[$lang]}"
-            echo "#EXTM3U" > languages/${lang}.raw.m3u
-            curl -s "https://iptv-org.github.io/iptv/languages/${code}.m3u" >> languages/${lang}.raw.m3u
-            cat languages/${lang}.raw.m3u >> mega_raw.m3u
+            echo "#EXTM3U" > "languages/${lang}.raw.m3u"
+            curl -fsSL "https://iptv-org.github.io/iptv/languages/${code}.m3u" >> "languages/${lang}.raw.m3u"
+            cat "languages/${lang}.raw.m3u" >> mega_raw.m3u
           done
 
-          ##############################################################
           # CATEGORIES (Sports / Movies / Kids / Music / News)
-          # Source: iptv-org category playlists  [2](https://renkz.com/free-m3u-playlists/)
-          ##############################################################
-          categories=(sports movies kids music news)
-
-          for cat in "${categories[@]}"; do
-            echo "#EXTM3U" > categories/${cat}.raw.m3u
-            curl -s "https://iptv-org.github.io/iptv/categories/${cat}.m3u" >> categories/${cat}.raw.m3u
-            cat categories/${cat}.raw.m3u >> mega_raw.m3u
+          for cat in sports movies kids music news; do
+            echo "#EXTM3U" > "categories/${cat}.raw.m3u"
+            curl -fsSL "https://iptv-org.github.io/iptv/categories/${cat}.m3u" >> "categories/${cat}.raw.m3u"
+            cat "categories/${cat}.raw.m3u" >> mega_raw.m3u
           done
 
-          ##############################################################
           # GLOBAL MASTER (~8000 channels)
-          # Source: iptv-org index.m3u  [4](https://blog.rdphostings.com/iptv-github-playlist)
-          ##############################################################
-          curl -s https://iptv-org.github.io/iptv/index.m3u >> mega_raw.m3u
+          curl -fsSL "https://iptv-org.github.io/iptv/index.m3u" >> mega_raw.m3u
 
-      ##############################
-      # STEP 4 — CLEAN + SORT + DEDUPE + LOGOS
-      ##############################
-      - name: Clean All Playlists
+      ################################################################
+      # STEP 4 — CLEAN + SORT + DEDUPE + FILTER OFFLINE + CSVs
+      ################################################################
+      - name: Clean & CSV All Playlists
         run: |
-          # Clean countries
+          set -euo pipefail
+
+          # Countries
           for f in countries/*.raw.m3u; do
             out="${f/.raw/}"
             ./clean.sh "$f" "$out"
+            ./m3u_to_csv.sh "$out" "data/${out%.m3u}.csv"
           done
 
-          # Clean languages
+          # Languages
           for f in languages/*.raw.m3u; do
             out="${f/.raw/}"
             ./clean.sh "$f" "$out"
+            ./m3u_to_csv.sh "$out" "data/${out%.m3u}.csv"
           done
 
-          # Clean categories
+          # Categories
           for f in categories/*.raw.m3u; do
             out="${f/.raw/}"
             ./clean.sh "$f" "$out"
+            ./m3u_to_csv.sh "$out" "data/${out%.m3u}.csv"
           done
 
-          # Clean mega
+          # Mega (aggregated)
           ./clean.sh mega_raw.m3u mega.m3u
+          ./m3u_to_csv.sh mega.m3u data/mega.csv
 
           # Remove raw files
           rm -f countries/*.raw.m3u languages/*.raw.m3u categories/*.raw.m3u mega_raw.m3u
 
-      ##############################
-      # STEP 5 — COMMIT & PUSH USING PAT
-      ##############################
+      ################################################################
+      # STEP 5 — AUTO-GENERATE README (badges + counts + links)
+      # Badges: GH workflow status + last-commit (Shields)  [5](https://www.jiotv.com/)[6](https://www.jio.com/jiohome/services/jiotvplus/)
+      ################################################################
+      - name: Generate README
+        run: |
+          set -euo pipefail
+
+          count() { grep -c '^#EXTINF' "$1" 2>/dev/null || echo 0; }
+
+          ci_badge="https://github.com/${GITHUB_REPOSITORY}/actions/workflows/super-mega.yml/badge.svg?branch=${GITHUB_REF_NAME}"
+          last_commit="https://img.shields.io/github/last-commit/${GITHUB_REPOSITORY}?logo=github"
+
+          # Country counts
+          IN=$(count countries/india.m3u) ; BD=$(count countries/bangladesh.m3u) ; PK=$(count countries/pakistan.m3u)
+          US=$(count countries/usa.m3u)   ; UK=$(count countries/uk.m3u)         ; ES=$(count countries/spain.m3u)
+
+          # Language counts
+          ENG=$(count languages/english.m3u) ; HIN=$(count languages/hindi.m3u)
+          BEN=$(count languages/bengali.m3u) ; URD=$(count languages/urdu.m3u)
+
+          # Category counts
+          SPO=$(count categories/sports.m3u) ; MOV=$(count categories/movies.m3u)
+          KID=$(count categories/kids.m3u)   ; MUS=$(count categories/music.m3u)
+          NEW=$(count categories/news.m3u)
+
+          MEGA=$(count mega.m3u)
+
+          cat > README.md <<EOF
+          # Mega IPTV (Auto-Built)
+
+          ${ci_badge} ${last_commit}
+
+          Auto-generated, cleaned, **deduplicated (by channel name)**, and **alphabetically sorted** IPTV playlists sourced from the public **iptv-org** project.  
+          • Country, Language, and Category lists are updated every 6 hours.  
+          • Offline channels are filtered using fast HTTP checks.  
+          • EPG: \`https://iptv-org.github.io/epg/guides.xml\`
+
+          > Browse the **HTML catalog**: **https://${GITHUB_REPOSITORY%/*}.github.io/${GITHUB_REPOSITORY#*/}/**
+
+          ## Playlists
+
+          ### Countries
+          - 🇮🇳 India — ${IN}  — \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/countries/india.m3u\`  — CSV: \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/data/countries/india.csv\`
+          - 🇧🇩 Bangladesh — ${BD} — \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/countries/bangladesh.m3u\` — CSV: \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/data/countries/bangladesh.csv\`
+          - 🇵🇰 Pakistan — ${PK} — \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/countries/pakistan.m3u\` — CSV: \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/data/countries/pakistan.csv\`
+          - 🇺🇸 USA — ${US} — \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/countries/usa.m3u\` — CSV: \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/data/countries/usa.csv\`
+          - 🇬🇧 UK — ${UK} — \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/countries/uk.m3u\` — CSV: \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/data/countries/uk.csv\`
+          - 🇪🇸 Spain — ${ES} — \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/countries/spain.m3u\` — CSV: \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/data/countries/spain.csv\`
+
+          ### Languages
+          - English — ${ENG} — \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/languages/english.m3u\` — CSV: \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/data/languages/english.csv\`
+          - Hindi — ${HIN} — \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/languages/hindi.m3u\` — CSV: \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/data/languages/hindi.csv\`
+          - Bengali — ${BEN} — \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/languages/bengali.m3u\` — CSV: \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/data/languages/bengali.csv\`
+          - Urdu — ${URD} — \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/languages/urdu.m3u\` — CSV: \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/data/languages/urdu.csv\`
+
+          ### Categories
+          - Sports — ${SPO} — \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/categories/sports.m3u\` — CSV: \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/data/categories/sports.csv\`
+          - Movies — ${MOV} — \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/categories/movies.m3u\` — CSV: \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/data/categories/movies.csv\`
+          - Kids — ${KID} — \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/categories/kids.m3u\` — CSV: \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/data/categories/kids.csv\`
+          - Music — ${MUS} — \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/categories/music.m3u\` — CSV: \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/data/categories/music.csv\`
+          - News — ${NEW} — \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/categories/news.m3u\` — CSV: \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/data/categories/news.csv\`
+
+          ### Mega (All Combined)
+          - Mega — ${MEGA} — \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/mega.m3u\` — CSV: \`https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/data/mega.csv\`
+
+          ---
+          **Source:** [iptv-org/iptv](https://github.com/iptv-org/iptv) — playlists by country, language & category; global index.  
+          **EPG:** [iptv-org/epg](https://github.com/iptv-org/epg) — XMLTV guides.
+
+          EOF
+
+      ################################################################
+      # STEP 6 — BUILD HTML CATALOG (GitHub Pages)
+      # Simple UI that loads CSVs and plays selected streams with hls.js
+      ################################################################
+      - name: Build HTML Catalog
+        run: |
+          set -euo pipefail
+
+          mkdir -p site/assets
+
+          # Lightweight index.html
+          cat > site/index.html <<'HTML'
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>Mega IPTV Catalog</title>
+            <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+            <style>
+              body { padding: 1rem; }
+              .grid { display: grid; grid-template-columns: 300px 1fr; gap: 1rem; }
+              table { font-size: 0.9rem; }
+              #video { width: 100%; max-height: 60vh; background:#000; }
+              .muted { color: #777; font-size: .85rem; }
+              .nowrap { white-space: nowrap; }
+            </style>
+          </head>
+          <body>
+            <main class="container">
+              <h2>Mega IPTV Catalog</h2>
+              <p class="muted">Click a list, pick a channel, then press ▶ Play.</p>
+
+              <div class="grid">
+                <aside>
+                  <h4>Playlists</h4>
+                  <details open>
+                    <summary>Countries</summary>
+                    <ul id="list-countries"></ul>
+                  </details>
+                  <details>
+                    <summary>Languages</summary>
+                    <ul id="list-languages"></ul>
+                  </details>
+                  <details>
+                    <summary>Categories</summary>
+                    <ul id="list-categories"></ul>
+                  </details>
+                  <hr/>
+                  <p><a id="megaCsv" href="#" target="_blank">Download Mega CSV</a></p>
+                </aside>
+
+                <section>
+                  <video id="video" controls playsinline></video>
+                  <div class="grid" style="grid-template-columns:1fr 220px; margin-top:.7rem;">
+                    <input id="search" type="search" placeholder="Search channel…" />
+                    <button id="clear">Clear</button>
+                  </div>
+                  <table id="table" role="grid">
+                    <thead><tr><th>Channel</th><th class="nowrap">Action</th></tr></thead>
+                    <tbody></tbody>
+                  </table>
+                </section>
+              </div>
+            </main>
+
+            <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+            <script>
+              const repo = location.pathname.replace(/^\\//,'').split('/')[0] ? location.pathname.split('/')[1] : '${GITHUB_REPOSITORY?.split('/')?.[1] ?? ""}';
+              const owner = location.hostname.split('.')[0]; // username
+              const baseRaw = `https://raw.githubusercontent.com/${owner}/${repo}/main`;
+
+              const playlists = {
+                countries: {
+                  india:       `${baseRaw}/data/countries/india.csv`,
+                  bangladesh:  `${baseRaw}/data/countries/bangladesh.csv`,
+                  pakistan:    `${baseRaw}/data/countries/pakistan.csv`,
+                  usa:         `${baseRaw}/data/countries/usa.csv`,
+                  uk:          `${baseRaw}/data/countries/uk.csv`,
+                  spain:       `${baseRaw}/data/countries/spain.csv`,
+                },
+                languages: {
+                  english: `${baseRaw}/data/languages/english.csv`,
+                  hindi:   `${baseRaw}/data/languages/hindi.csv`,
+                  bengali: `${baseRaw}/data/languages/bengali.csv`,
+                  urdu:    `${baseRaw}/data/languages/urdu.csv`,
+                },
+                categories: {
+                  sports: `${baseRaw}/data/categories/sports.csv`,
+                  movies: `${baseRaw}/data/categories/movies.csv`,
+                  kids:   `${baseRaw}/data/categories/kids.csv`,
+                  music:  `${baseRaw}/data/categories/music.csv`,
+                  news:   `${baseRaw}/data/categories/news.csv`,
+                },
+                mega: `${baseRaw}/data/mega.csv`
+              };
+
+              document.getElementById('megaCsv').href = playlists.mega;
+
+              const ulC = document.getElementById('list-countries');
+              const ulL = document.getElementById('list-languages');
+              const ulK = document.getElementById('list-categories');
+
+              const addLinks = (ul, obj) => {
+                Object.entries(obj).forEach(([k,url]) => {
+                  const li=document.createElement('li'); const a=document.createElement('a');
+                  a.href='#'; a.textContent=k; a.onclick=(e)=>{ e.preventDefault(); loadCsv(url); };
+                  li.appendChild(a); ul.appendChild(li);
+                });
+              };
+              addLinks(ulC, playlists.countries);
+              addLinks(ulL, playlists.languages);
+              addLinks(ulK, playlists.categories);
+
+              const tbody = document.querySelector('#table tbody');
+              const search = document.getElementById('search');
+              const clear  = document.getElementById('clear');
+              let rows = [];
+
+              async function loadCsv(url){
+                const res = await fetch(url); const text = await res.text();
+                const lines = text.trim().split(/\\r?\\n/).slice(1); // skip header
+                rows = lines.map(l => {
+                  const m = l.match(/^\"?(.*?)\"?,(https?:.*)$/); 
+                  return m ? {name:m[1].replace(/\"\"/g,'"'), url:m[2]} : null;
+                }).filter(Boolean);
+                render();
+              }
+
+              function render(){
+                const q = search.value.toLowerCase();
+                tbody.innerHTML = '';
+                rows.filter(r => r.name.toLowerCase().includes(q)).forEach(r=>{
+                  const tr=document.createElement('tr');
+                  const td1=document.createElement('td'); td1.textContent=r.name;
+                  const td2=document.createElement('td'); td2.className='nowrap';
+                  const btn=document.createElement('button'); btn.textContent='▶ Play';
+                  btn.onclick=()=>play(r.url);
+                  td2.appendChild(btn);
+                  tr.appendChild(td1); tr.appendChild(td2);
+                  tbody.appendChild(tr);
+                });
+              }
+
+              search.addEventListener('input', render);
+              clear.addEventListener('click', ()=>{ search.value=''; render(); });
+
+              let hls;
+              function play(url){
+                const video = document.getElementById('video');
+                if (hls) { hls.destroy(); hls=null; }
+                if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                  video.src = url; video.play();
+                } else if (Hls.isSupported()){
+                  hls = new Hls(); hls.loadSource(url); hls.attachMedia(video); hls.on(Hls.Events.MANIFEST_PARSED, ()=>video.play());
+                } else {
+                  alert('HLS not supported in this browser.');
+                }
+              }
+
+              // Load something by default
+              loadCsv(playlists.mega);
+            </script>
+          </body>
+          </html>
+          HTML
+
+      ################################################################
+      # STEP 7 — COMMIT & PUSH (PAT) with safe rebase
+      ################################################################
       - name: Commit and Push Changes (PAT)
         env:
           TOKEN: ${{ secrets.PAT_TOKEN }}
           REPO: ${{ github.repository }}
           BRANCH: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           git config --global user.name "AutoBot"
           git config --global user.email "bot@example.com"
+
           git add .
-          git commit -m "Cleaned + Sorted + Deduped IPTV playlists" || echo "No changes"
-          git remote set-url origin https://sarfaraj74-Tech:${TOKEN}@github.com/${REPO}.git
-          git push origin HEAD:${BRANCH}
+          git commit -m "CSV summaries + HTML catalog (click-to-play) + cleaned & sorted" || echo "No changes"
+
+          git remote set-url origin "https://sarfaraj74-Tech:${TOKEN}@github.com/${REPO}.git"
+          git fetch origin
+          git pull --rebase origin "${BRANCH}" || echo "Rebase not needed"
+          git push origin HEAD:"${BRANCH}"
+
+      ################################################################
+      # STEP 8 — PAGES ARTIFACT (deploy 'site/' to GitHub Pages)
+      ################################################################
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
