@@ -10,104 +10,164 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1) IMPORTANT: do NOT persist credentials from the default GITHUB_TOKEN
+      ##############################
+      # STEP 1 — CHECKOUT
+      ##############################
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           persist-credentials: false
           fetch-depth: 0
 
-      # 2) Build the mega playlist
-      - name: Build Super Mega Playlist
+      ##############################
+      # STEP 2 — DEFINE CLEAN FUNCTION
+      ##############################
+      - name: Define cleaning function
         run: |
-          echo '#EXTM3U url-tvg="https://iptv-org.github.io/epg/guides.xml"' > mega.m3u
+          cat << 'EOF' > clean.sh
+          #!/bin/bash
+          infile="$1"
+          outfile="$2"
 
-          ###########################
-          # COUNTRIES (South Asia)
-          ###########################
-          echo '' >> mega.m3u
-          echo '############ INDIA ############' >> mega.m3u
-          curl -s https://iptv-org.github.io/iptv/countries/in.m3u >> mega.m3u
+          # Extract all EXTINF lines paired with URLs
+          paste -d'\n' <(grep -E "^#EXTINF" "$infile") <(grep -v "^#" "$infile" | grep -E "\.m3u8|http") > temp_pairs.txt
 
-          echo '' >> mega.m3u
-          echo '############ BANGLADESH ############' >> mega.m3u
-          curl -s https://iptv-org.github.io/iptv/countries/bd.m3u >> mega.m3u
+          # Remove duplicates by channel name (2B)
+          # Extract channel name from the EXTINF line (after last comma)
+          awk -v FS="," '
+            NR%2==1 { 
+              name=$NF; gsub(/^[ \t]+|[ \t]+$/, "", name)
+              extinf=$0
+              getline url
+              if (!seen[name]++) {
+                print extinf >> "pairs_cleaned.txt"
+                print url >> "pairs_cleaned.txt"
+              }
+            }
+          ' temp_pairs.txt
 
-          echo '' >> mega.m3u
-          echo '############ PAKISTAN ############' >> mega.m3u
-          curl -s https://iptv-org.github.io/iptv/countries/pk.m3u >> mega.m3u
+          # Sort alphabetically by channel name (1A)
+          awk 'NR%2==1 {name=$0; getline url; print name"::"url}' pairs_cleaned.txt \
+            | sort -f \
+            | awk -F"::" '{print $1"\n"$2}' > sorted.txt
 
-          ###########################
-          # CONTENT CATEGORIES
-          ###########################
-          echo '' >> mega.m3u
-          echo '############ SPORTS (GLOBAL) ############' >> mega.m3u
-          curl -s https://iptv-org.github.io/iptv/categories/sports.m3u >> mega.m3u
+          # Rebuild final M3U
+          {
+            echo "#EXTM3U"
+            cat sorted.txt
+          } > "$outfile"
 
-          echo '' >> mega.m3u
-          echo '############ NEWS (GLOBAL) ############' >> mega.m3u
-          curl -s https://iptv-org.github.io/iptv/categories/news.m3u >> mega.m3u
+          rm -f temp_pairs.txt pairs_cleaned.txt sorted.txt
+          EOF
 
-          echo '' >> mega.m3u
-          echo '############ MOVIES (GLOBAL) ############' >> mega.m3u
-          curl -s https://iptv-org.github.io/iptv/categories/movies.m3u >> mega.m3u
+          chmod +x clean.sh
 
-          echo '' >> mega.m3u
-          echo '############ KIDS (GLOBAL) ############' >> mega.m3u
-          curl -s https://iptv-org.github.io/iptv/categories/kids.m3u >> mega.m3u
+      ##############################
+      # STEP 3 — BUILD RAW PLAYLISTS
+      ##############################
+      - name: Build Raw Playlists
+        run: |
+          mkdir -p countries languages categories
 
-          echo '' >> mega.m3u
-          echo '############ MUSIC (GLOBAL) ############' >> mega.m3u
-          curl -s https://iptv-org.github.io/iptv/categories/music.m3u >> mega.m3u
+          echo '#EXTM3U url-tvg="https://iptv-org.github.io/epg/guides.xml"' > mega_raw.m3u
 
-          ###########################
-          # LANGUAGES (GLOBAL)
-          ###########################
-          echo '' >> mega.m3u
-          echo '############ ENGLISH ############' >> mega.m3u
-          curl -s https://iptv-org.github.io/iptv/languages/eng.m3u >> mega.m3u
+          ##############################################################
+          # COUNTRIES (India / Bangladesh / Pakistan / USA / UK / Spain)
+          # Source: iptv-org country playlists  [1](https://www.jiotv.com/)
+          ##############################################################
+          declare -A country_map=(
+            ["india"]="in"
+            ["bangladesh"]="bd"
+            ["pakistan"]="pk"
+            ["usa"]="us"
+            ["uk"]="gb"
+            ["spain"]="es"
+          )
 
-          echo '' >> mega.m3u
-          echo '############ HINDI ############' >> mega.m3u
-          curl -s https://iptv-org.github.io/iptv/languages/hin.m3u >> mega.m3u
+          for country in "${!country_map[@]}"; do
+            code="${country_map[$country]}"
+            echo "#EXTM3U" > countries/${country}.raw.m3u
+            curl -s "https://iptv-org.github.io/iptv/countries/${code}.m3u" >> countries/${country}.raw.m3u
+            cat countries/${country}.raw.m3u >> mega_raw.m3u
+          done
 
-          echo '' >> mega.m3u
-          echo '############ BENGALI ############' >> mega.m3u
-          curl -s https://iptv-org.github.io/iptv/languages/ben.m3u >> mega.m3u
+          ##############################################################
+          # LANGUAGES (English / Hindi / Bengali / Urdu)
+          # Source: iptv-org language playlists  [3](https://apps.apple.com/in/app/jiotv/id6467191146)
+          ##############################################################
+          declare -A lang_map=(
+            ["english"]="eng"
+            ["hindi"]="hin"
+            ["bengali"]="ben"
+            ["urdu"]="urd"
+          )
 
-          echo '' >> mega.m3u
-          echo '############ URDU ############' >> mega.m3u
-          curl -s https://iptv-org.github.io/iptv/languages/urd.m3u >> mega.m3u
+          for lang in "${!lang_map[@]}"; do
+            code="${lang_map[$lang]}"
+            echo "#EXTM3U" > languages/${lang}.raw.m3u
+            curl -s "https://iptv-org.github.io/iptv/languages/${code}.m3u" >> languages/${lang}.raw.m3u
+            cat languages/${lang}.raw.m3u >> mega_raw.m3u
+          done
 
-          ###########################
-          # GLOBAL MASTER LIST
-          ###########################
-          echo '' >> mega.m3u
-          echo '############ GLOBAL (ALL CHANNELS) ############' >> mega.m3u
-          curl -s https://iptv-org.github.io/iptv/index.m3u >> mega.m3u
+          ##############################################################
+          # CATEGORIES (Sports / Movies / Kids / Music / News)
+          # Source: iptv-org category playlists  [2](https://renkz.com/free-m3u-playlists/)
+          ##############################################################
+          categories=(sports movies kids music news)
 
-      # 3) Commit and push using your PAT (NOT the bot token)
+          for cat in "${categories[@]}"; do
+            echo "#EXTM3U" > categories/${cat}.raw.m3u
+            curl -s "https://iptv-org.github.io/iptv/categories/${cat}.m3u" >> categories/${cat}.raw.m3u
+            cat categories/${cat}.raw.m3u >> mega_raw.m3u
+          done
+
+          ##############################################################
+          # GLOBAL MASTER (~8000 channels)
+          # Source: iptv-org index.m3u  [4](https://blog.rdphostings.com/iptv-github-playlist)
+          ##############################################################
+          curl -s https://iptv-org.github.io/iptv/index.m3u >> mega_raw.m3u
+
+      ##############################
+      # STEP 4 — CLEAN + SORT + DEDUPE + LOGOS
+      ##############################
+      - name: Clean All Playlists
+        run: |
+          # Clean countries
+          for f in countries/*.raw.m3u; do
+            out="${f/.raw/}"
+            ./clean.sh "$f" "$out"
+          done
+
+          # Clean languages
+          for f in languages/*.raw.m3u; do
+            out="${f/.raw/}"
+            ./clean.sh "$f" "$out"
+          done
+
+          # Clean categories
+          for f in categories/*.raw.m3u; do
+            out="${f/.raw/}"
+            ./clean.sh "$f" "$out"
+          done
+
+          # Clean mega
+          ./clean.sh mega_raw.m3u mega.m3u
+
+          # Remove raw files
+          rm -f countries/*.raw.m3u languages/*.raw.m3u categories/*.raw.m3u mega_raw.m3u
+
+      ##############################
+      # STEP 5 — COMMIT & PUSH USING PAT
+      ##############################
       - name: Commit and Push Changes (PAT)
         env:
           TOKEN: ${{ secrets.PAT_TOKEN }}
-          REPO: ${{ github.repository }}        # e.g., sarfaraj74-Tech/megaiptv-auto
-          BRANCH: ${{ github.ref_name }}        # e.g., main
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
         run: |
-          set -e
           git config --global user.name "AutoBot"
           git config --global user.email "bot@example.com"
-          git add mega.m3u
-          git commit -m "Auto-update Super Mega IPTV Playlist" || echo "No changes"
-
-          # Show current remote for debugging
-          echo "Before: origin remote is:"
-          git remote -v
-
-          # Force the origin remote to use your PAT
+          git add .
+          git commit -m "Cleaned + Sorted + Deduped IPTV playlists" || echo "No changes"
           git remote set-url origin https://sarfaraj74-Tech:${TOKEN}@github.com/${REPO}.git
-
-          echo "After: origin remote is:"
-          git remote -v
-
-          # Push to the same branch that triggered the run
           git push origin HEAD:${BRANCH}
