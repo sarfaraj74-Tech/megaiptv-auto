@@ -1,1 +1,96 @@
+name: Auto-Build Super Mega IPTV Playlist
 
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # Run every 6 hours
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Build Super Mega Playlist
+        run: |
+          echo '#EXTM3U url-tvg="https://iptv-org.github.io/epg/guides.xml"' > mega.m3u
+
+          ###########################
+          # COUNTRIES (South Asia)
+          ###########################
+          echo '' >> mega.m3u
+          echo '############ INDIA ############' >> mega.m3u
+          curl -s https://iptv-org.github.io/iptv/countries/in.m3u >> mega.m3u
+
+          echo '' >> mega.m3u
+          echo '############ BANGLADESH ############' >> mega.m3u
+          curl -s https://iptv-org.github.io/iptv/countries/bd.m3u >> mega.m3u
+
+          echo '' >> mega.m3u
+          echo '############ PAKISTAN ############' >> mega.m3u
+          curl -s https://iptv-org.github.io/iptv/countries/pk.m3u >> mega.m3u
+
+          ###########################
+          # CONTENT CATEGORIES
+          ###########################
+          echo '' >> mega.m3u
+          echo '############ SPORTS (GLOBAL) ############' >> mega.m3u
+          curl -s https://iptv-org.github.io/iptv/categories/sports.m3u >> mega.m3u
+
+          echo '' >> mega.m3u
+          echo '############ NEWS (GLOBAL) ############' >> mega.m3u
+          curl -s https://iptv-org.github.io/iptv/categories/news.m3u >> mega.m3u
+
+          echo '' >> mega.m3u
+          echo '############ MOVIES (GLOBAL) ############' >> mega.m3u
+          curl -s https://iptv-org.github.io/iptv/categories/movies.m3u >> mega.m3u
+
+          echo '' >> mega.m3u
+          echo '############ KIDS (GLOBAL) ############' >> mega.m3u
+          curl -s https://iptv-org.github.io/iptv/categories/kids.m3u >> mega.m3u
+
+          echo '' >> mega.m3u
+          echo '############ MUSIC (GLOBAL) ############' >> mega.m3u
+          curl -s https://iptv-org.github.io/iptv/categories/music.m3u >> mega.m3u
+
+          ###########################
+          # LANGUAGES (GLOBAL)
+          ###########################
+          echo '' >> mega.m3u
+          echo '############ ENGLISH ############' >> mega.m3u
+          curl -s https://iptv-org.github.io/iptv/languages/eng.m3u >> mega.m3u
+
+          echo '' >> mega.m3u
+          echo '############ HINDI ############' >> mega.m3u
+          curl -s https://iptv-org.github.io/iptv/languages/hin.m3u >> mega.m3u
+
+          echo '' >> mega.m3u
+          echo '############ BENGALI ############' >> mega.m3u
+          curl -s https://iptv-org.github.io/iptv/languages/ben.m3u >> mega.m3u
+
+          echo '' >> mega.m3u
+          echo '############ URDU ############' >> mega.m3u
+          curl -s https://iptv-org.github.io/iptv/languages/urd.m3u >> mega.m3u
+
+          ###########################
+          # GLOBAL MASTER LIST
+          ###########################
+          echo '' >> mega.m3u
+          echo '############ GLOBAL (ALL CHANNELS) ############' >> mega.m3u
+          curl -s https://iptv-org.github.io/iptv/index.m3u >> mega.m3u
+
+      #########################################
+      # PAT AUTHENTICATED PUSH (IMPORTANT)
+      #########################################
+      - name: Commit and Push Changes
+        env:
+          TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          git config --global user.name "AutoBot"
+          git config --global user.email "bot@example.com"
+          git add mega.m3u
+          git commit -m "Auto-update Super Mega IPTV Playlist" || echo "No changes"
+          git remote set-url origin https://sarfaraj74-Tech:${TOKEN}@github.com/sarfaraj74-Tech/megaiptv-auto.git
+          git push origin HEAD:main
