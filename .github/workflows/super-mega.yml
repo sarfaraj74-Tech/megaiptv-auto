@@ -10,9 +10,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # 1) IMPORTANT: do NOT persist credentials from the default GITHUB_TOKEN
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
 
+      # 2) Build the mega playlist
       - name: Build Super Mega Playlist
         run: |
           echo '#EXTM3U url-tvg="https://iptv-org.github.io/epg/guides.xml"' > mega.m3u
@@ -81,16 +86,28 @@ jobs:
           echo '############ GLOBAL (ALL CHANNELS) ############' >> mega.m3u
           curl -s https://iptv-org.github.io/iptv/index.m3u >> mega.m3u
 
-      #########################################
-      # PAT AUTHENTICATED PUSH (IMPORTANT)
-      #########################################
-      - name: Commit and Push Changes
+      # 3) Commit and push using your PAT (NOT the bot token)
+      - name: Commit and Push Changes (PAT)
         env:
           TOKEN: ${{ secrets.PAT_TOKEN }}
+          REPO: ${{ github.repository }}        # e.g., sarfaraj74-Tech/megaiptv-auto
+          BRANCH: ${{ github.ref_name }}        # e.g., main
         run: |
+          set -e
           git config --global user.name "AutoBot"
           git config --global user.email "bot@example.com"
           git add mega.m3u
           git commit -m "Auto-update Super Mega IPTV Playlist" || echo "No changes"
-          git remote set-url origin https://sarfaraj74-Tech:${TOKEN}@github.com/sarfaraj74-Tech/megaiptv-auto.git
-          git push origin HEAD:main
+
+          # Show current remote for debugging
+          echo "Before: origin remote is:"
+          git remote -v
+
+          # Force the origin remote to use your PAT
+          git remote set-url origin https://sarfaraj74-Tech:${TOKEN}@github.com/${REPO}.git
+
+          echo "After: origin remote is:"
+          git remote -v
+
+          # Push to the same branch that triggered the run
+          git push origin HEAD:${BRANCH}
