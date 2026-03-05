@@ -1,4 +1,4 @@
-name: Auto-Build Super Mega IPTV Playlist (Categorized Minimal)
+name: Auto-Build Mega Playlist (Language - Category)
 
 on:
   schedule:
@@ -13,116 +13,87 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # 1) Checkout without persisting the default token
       - name: Checkout
         uses: actions/checkout@v4
         with:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Build categorized playlists (countries + per-country languages + categories + mega)
+      # 2) Build mega.m3u with group-title="<Language> - <Category>"
+      - name: Build Mega Playlist
         run: |
           set -euo pipefail
 
-          # Fresh dirs
-          rm -rf countries categories tmp_lang || true
-          mkdir -p countries categories tmp_lang
+          # Fetch full global index with metadata (tvg-language, group-title, etc.)
+          curl -fsSL "https://iptv-org.github.io/iptv/index.m3u" -o full.m3u
 
-          # Start mega
+          # Write header
           echo "#EXTM3U" > mega.m3u
 
-          # ------------------------
-          # Country map (root files)
-          # ------------------------
-          declare -A COUNTRY_CODE=(
-            [india]=in
-            [bangladesh]=bd
-            [pakistan]=pk
-            [usa]=us
-            [uk]=gb
-            [spain]=es
-          )
-
-          # ------------------------
-          # Language map (for subfolders)
-          # ------------------------
-          declare -A LANG_CODE=(
-            [english]=eng
-            [hindi]=hin
-            [bengali]=ben
-            [urdu]=urd
-          )
-
-          # ------------------------
-          # 1) Download country root files and append to mega
-          # ------------------------
-          for country in "${!COUNTRY_CODE[@]}"; do
-            ccode="${COUNTRY_CODE[$country]}"
-            echo "#EXTM3U" > "countries/${country}.m3u"
-            curl -fsSL "https://iptv-org.github.io/iptv/countries/${ccode}.m3u" >> "countries/${country}.m3u" || true
-            # Append to mega
-            cat "countries/${country}.m3u" >> mega.m3u
-          done
-
-          # ------------------------
-          # 2) Download language lists once (to tmp_lang)
-          # ------------------------
-          for lang in "${!LANG_CODE[@]}"; do
-            lcode="${LANG_CODE[$lang]}"
-            curl -fsSL "https://iptv-org.github.io/iptv/languages/${lcode}.m3u" -o "tmp_lang/${lang}.m3u" || echo "#EXTM3U" > "tmp_lang/${lang}.m3u"
-          done
-
-          # Helper: intersect a country root M3U and a language M3U by URL
-          # Writes a header + only those (#EXTINF + URL) pairs whose URL is present in the country's list.
-          intersect_country_language() {
-            local country_file="$1"    # countries/india.m3u
-            local language_file="$2"   # tmp_lang/english.m3u
-            local out_file="$3"        # countries/india/english.m3u
-
-            echo "#EXTM3U" > "$out_file"
-
-            # Build a set of URLs present in the country file
-            awk '!/^#/{print}' "$country_file" | sort -u > tmp_lang/urls_country.txt
-
-            # Walk the language file as EXTINF + URL pairs; emit only if URL in set
-            awk -v U=tmp_lang/urls_country.txt '
-              BEGIN{
-                while ((getline u < U) > 0) url[u]=1
-                close(U)
+          # Transform each EXTINF so group-title becomes "<Language> - <Category>"
+          # - Language from tvg-language (fallback: Unknown)
+          # - Category from original group-title (fallback: General)
+          # - Title-case both
+          # - Preserve all other attributes (tvg-id, tvg-logo, tvg-language, etc.) and channel name
+          awk '
+            function trim(s) { gsub(/^[ \t\r\n]+|[ \t\r\n]+$/,"",s); return s }
+            function title(s,   a,i,out,w) {
+              s=trim(s); if (s=="") return s
+              split(s,a,/[ _-]+/)
+              out=""
+              for(i=1;i<=length(a);i++){
+                w=a[i]; if (w=="") continue
+                out = out (out==""?"":" ") toupper(substr(w,1,1)) tolower(substr(w,2))
               }
-              /^#EXTINF/ { ext=$0; getline link; if (link ~ /^https?:\/\//) { if (url[link]) { print ext; print link } } }
-            ' "$language_file" >> "$out_file"
+              return out
+            }
+            /^#EXTINF/ {
+              ext=$0
+              name=ext
+              # Extract channel name (text after last comma)
+              sub(/^.*,/, "", name)
+              # Extract tvg-language (may be empty or multi-valued)
+              lang=""
+              if (match(ext, /tvg-language="([^"]*)"/, m)) { lang = m[1] }
+              # Use first token if multiple (split on , ; /)
+              split(lang, lp, /[,;\/]/); lang = trim(lp[1])
+              if (lang == "") lang = "Unknown"
 
-            rm -f tmp_lang/urls_country.txt
-          }
+              # Extract original category from group-title
+              cat=""
+              if (match(ext, /group-title="([^"]*)"/, m2)) { cat = m2[1] }
+              if (cat == "") cat = "General"
 
-          # ------------------------
-          # 3) Per-country language subfolders (India, Bangladesh, Pakistan)
-          # ------------------------
-          for country in india bangladesh pakistan; do
-            mkdir -p "countries/${country}"
-            for lang in english hindi bengali urdu; do
-              intersect_country_language "countries/${country}.m3u" "tmp_lang/${lang}.m3u" "countries/${country}/${lang}.m3u"
-            done
-          done
+              # Clean formatting (Title Case both)
+              lang = title(lang)
+              cat  = title(cat)
 
-          # ------------------------
-          # 4) Categories (append each to mega)
-          # ------------------------
-          for cat in sports movies kids music news; do
-            echo "#EXTM3U" > "categories/${cat}.m3u"
-            curl -fsSL "https://iptv-org.github.io/iptv/categories/${cat}.m3u" >> "categories/${cat}.m3u" || true
-            cat "categories/${cat}.m3u" >> mega.m3u
-          done
+              # Build new group
+              newgrp = lang " - " cat
 
-          # ------------------------
-          # 5) Global master (append last)
-          # ------------------------
-          curl -fsSL "https://iptv-org.github.io/iptv/index.m3u" >> mega.m3u || true
+              # Rebuild the EXTINF line with new group-title while preserving other attributes
+              before = ext
+              sub(/,.*$/, "", before)          # part before channel name
+              # If a group-title exists, replace it; otherwise, insert it before the comma
+              if (before ~ /group-title="/) {
+                gsub(/group-title="[^"]*"/, "group-title=\"" newgrp "\"", before)
+                newext = before "," name
+              } else {
+                newext = before " group-title=\"" newgrp "\"," name
+              }
 
-          # Cleanup temporary folder
-          rm -rf tmp_lang || true
+              # Next line is the URL (print pair)
+              getline url
+              print newext >> "mega.m3u"
+              print url    >> "mega.m3u"
+            }
+          ' full.m3u
 
-      - name: Commit & push (using PAT)
+          rm -f full.m3u
+
+      # 3) Commit & push using PAT (safe rebase to avoid non-fast-forward)
+      - name: Commit & push
         env:
           TOKEN:  ${{ secrets.PAT_TOKEN }}
           REPO:   ${{ github.repository }}
@@ -132,8 +103,8 @@ jobs:
           git config --global user.name  "AutoBot"
           git config --global user.email "bot@example.com"
 
-          git add .
-          git commit -m "Build categorized playlists: mega + categories + country roots + per-country language folders" || echo "No changes"
+          git add mega.m3u
+          git commit -m "Auto: mega.m3u with group-title=<Language> - <Category>" || echo "No changes"
 
           git remote set-url origin "https://sarfaraj74-Tech:${TOKEN}@github.com/${REPO}.git"
           git fetch origin
